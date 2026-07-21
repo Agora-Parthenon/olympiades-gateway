@@ -1,0 +1,17 @@
+{
+  "name": "olympiades-gateway",
+  "version": "0.1.0",
+  "description": "Minimal gateway for Olympiades: JWT verification, REST + WS proxy",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6",
+    "jwks-rsa": "^2.0.5",
+    "express-jwt": "^7.7.5",
+    "http-proxy": "^1.18.1",
+    "ws": "^8.13.0"
+  }
+}
