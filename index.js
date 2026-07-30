@@ -5,6 +5,7 @@ const { expressjwt: jwt } = require('express-jwt');
 const http = require('http');
 const httpProxy = require('http-proxy');
 const url = require('url');
+const addresses = require("./addresses.json");
 const jsonwebtoken = require('jsonwebtoken');
 const cors = require('cors');
 
@@ -93,9 +94,9 @@ function rejectUpgrade(socket, code, message) {
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const platformProxy = createProxyMiddleware({
-  target: 'http://platform:8080',
+  target: `http://${addresses.platform.name}:${addresses.platform.port}`,
   changeOrigin: true,
-  pathRewrite: {'^/api/platform': ''},
+  pathRewrite: (path) => path.replace(`/api/${addresses.platform.name}`, ""),
   onProxyReq: (proxyReq, req) => {
     const payload = req.auth;
     if (payload) {
@@ -105,10 +106,35 @@ const platformProxy = createProxyMiddleware({
   },
 });
 
-// Proxy rules: route /api/platform -> platform:8080, /api/uno -> uno:8080
-app.use('/api/platform', platformProxy);
+// Proxy rules: route /api/platform -> platform:8080, /api/game -> game:8080
+app.use(`/api/${addresses.platform.name}`, platformProxy);
 app.use('/admin', requireRole('ROLE_ADMIN'), platformProxy);
-app.use('/api/uno', createProxyMiddleware({ target: 'http://uno:8080', changeOrigin: true, pathRewrite: {'^/api/uno': ''} }));
+for (const game in addresses.games) {
+    app.use(`/api/${game.name}`, createProxyMiddleware(
+        {
+            target: `http://${game.name}:${game.port}`,
+            changeOrigin: true,
+            pathRewrite: (path) => path.replace(`/api/${game.name}`, "")
+        }
+    ));
+}
+
+//handling errors in api calls
+app.use('/api', (req, res) => {
+    const parsed = url.parse(req.url, true);
+    const service = parsed.query.service || parsed.pathname.split('/')[1] || "";
+    const returnMessage = service === "" ?
+        {
+            "error": `no service asked`,
+            "message": "Request must contains service name"
+        } :
+        {
+            "error": `unknown service: ${service}`,
+            "message": "You are trying to request a service that may not exist " +
+                "or the service name provided in request is invalid"
+        };
+    res.status(400).send(returnMessage);
+})
 
 // Upgrade (WebSocket) handling: route by query param 'service' or path
 server.on('upgrade', async (req, socket, head) => {
@@ -129,10 +155,13 @@ server.on('upgrade', async (req, socket, head) => {
   }
 
   req.auth = payload;
-  const service = parsed.query.service || parsed.pathname.split('/')[2] || 'platform';
-  let target = 'ws://platform:8080';
-  if (service === 'uno' || parsed.pathname.includes('uno')) target = 'ws://uno:8080';
-  if (service === 'game' || parsed.pathname.includes('game')) target = 'ws://platform:8080';
+  const service = parsed.query.service || parsed.pathname.split('/')[2] || `${addresses.platform.name}`;
+  let target = `ws://${addresses.platform.name}:${addresses.platform.port}`;
+  for (const game in addresses.games) {
+      if (service === game.name || parsed.pathname.includes(game.name)) target = `ws://${game.name}:${game.port}`;
+  }
+  if (service === 'game' || parsed.pathname.includes('game'))
+      target = `ws://${addresses.platform.name}:${addresses.platform.port}`;
   proxy.ws(req, socket, head, { target });
 });
 
