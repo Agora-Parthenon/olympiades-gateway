@@ -5,6 +5,7 @@ const { expressjwt: jwt } = require('express-jwt');
 const http = require('http');
 const httpProxy = require('http-proxy');
 const url = require('url');
+const jsonwebtoken = require('jsonwebtoken');
 
 const PORT = process.env.PORT || 8080;
 const KEYCLOAK_ISSUER = process.env.KEYCLOAK_ISSUER || 'http://keycloak:8180/realms/olympiades';
@@ -45,6 +46,39 @@ app.use(
   }).unless({ path: [/^\/public/, /^\/health/] })
 );
 
+// --- Vérification JWT pour les upgrades WebSocket ---
+const jwksClient = jwksRsa({
+  cache: true,
+  rateLimit: true,
+  jwksUri: KEYCLOAK_JWKS_URI
+});
+
+function getSigningKey(header, callback) {
+  jwksClient.getSigningKey(header.kid, (err, key) => {
+    if (err) return callback(err);
+    callback(null, key.getPublicKey());
+  });
+}
+
+function verifyWsToken(token) {
+  return new Promise((resolve, reject) => {
+    jsonwebtoken.verify(
+      token,
+      getSigningKey,
+      { algorithms: ['RS256'], issuer: KEYCLOAK_ISSUER },
+      (err, decoded) => {
+        if (err) return reject(err);
+        resolve(decoded);
+      }
+    );
+  });
+}
+
+function rejectUpgrade(socket, code, message) {
+  socket.write(`HTTP/1.1 ${code} ${message}\r\n\r\n`);
+  socket.destroy();
+}
+
 // Simple health
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
@@ -67,8 +101,24 @@ app.use('/admin', requireRole('ROLE_ADMIN'), platformProxy);
 app.use('/api/uno', createProxyMiddleware({ target: 'http://uno:8080', changeOrigin: true, pathRewrite: {'^/api/uno': ''} }));
 
 // Upgrade (WebSocket) handling: route by query param 'service' or path
-server.on('upgrade', (req, socket, head) => {
+server.on('upgrade', async (req, socket, head) => {
   const parsed = url.parse(req.url, true);
+  const token = parsed.query.token;
+
+  if (!token) {
+    rejectUpgrade(socket, 401, 'Unauthorized');
+    return;
+  }
+
+  let payload;
+  try {
+    payload = await verifyWsToken(token);
+  } catch (err) {
+    rejectUpgrade(socket, 401, 'Unauthorized');
+    return;
+  }
+
+  req.auth = payload;
   const service = parsed.query.service || parsed.pathname.split('/')[2] || 'platform';
   let target = 'ws://platform:8080';
   if (service === 'uno' || parsed.pathname.includes('uno')) target = 'ws://uno:8080';
