@@ -6,7 +6,11 @@ const http = require('http');
 const httpProxy = require('http-proxy');
 const url = require('url');
 const jsonwebtoken = require('jsonwebtoken');
+const cors = require('cors');
 
+const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:3000')
+  .split(',')
+  .map((origin) => origin.trim());
 const PORT = process.env.PORT || 8080;
 const KEYCLOAK_ISSUER = process.env.KEYCLOAK_ISSUER || 'http://keycloak:8180/realms/olympiades';
 
@@ -43,7 +47,13 @@ app.use(
     algorithms: ['RS256'],
     issuer: KEYCLOAK_ISSUER,
     credentialsRequired: true
-  }).unless({ path: [/^\/public/, /^\/health/] })
+  }).unless({ path: [/^\/public/, /^\/health/] }),
+  cors({
+      origin: ALLOWED_ORIGINS,
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+    })
 );
 
 // --- Vérification JWT pour les upgrades WebSocket ---
