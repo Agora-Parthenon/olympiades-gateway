@@ -1,0 +1,126 @@
+name: CI
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+      - develop
+      - staging
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+jobs:
+  build-test:
+    name: Syntaxe, tests & build Docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Installer Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      # La gateway n'a pas encore de lint ni de tests : on vérifie la syntaxe,
+      # et les scripts lint / test sont lancés automatiquement dès qu'ils existent
+      # dans package.json (--if-present).
+      - name: Vérifier la syntaxe
+        id: syntax
+        shell: bash
+        run: |
+          set +e
+          node --check index.js > syntax-output.txt 2>&1
+          status=$?
+          cat syntax-output.txt
+          exit $status
+        continue-on-error: true
+
+      - name: Vérifier le lint
+        id: lint
+        shell: bash
+        run: |
+          set +e
+          npm run lint --if-present > lint-output.txt 2>&1
+          status=$?
+          cat lint-output.txt
+          exit $status
+        continue-on-error: true
+
+      - name: Lancer les tests
+        id: tests
+        shell: bash
+        run: |
+          set +e
+          npm test --if-present > tests-output.txt 2>&1
+          status=$?
+          cat tests-output.txt
+          exit $status
+        continue-on-error: true
+
+      - name: Construire l'image Docker
+        id: docker
+        shell: bash
+        run: |
+          set +e
+          docker build -t olympiades-gateway:ci . > docker-output.txt 2>&1
+          status=$?
+          tail -n 50 docker-output.txt
+          exit $status
+        continue-on-error: true
+
+      - name: Publier le détail des validations dans le résumé
+        if: always()
+        shell: bash
+        run: |
+          echo "## Détail des validations" >> "$GITHUB_STEP_SUMMARY"
+          for name in syntax lint tests docker; do
+            file="${name}-output.txt"
+            if [ -f "$file" ] && [ -s "$file" ]; then
+              echo "### ${name}" >> "$GITHUB_STEP_SUMMARY"
+              tail -n 100 "$file" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Publier les résultats détaillés en artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-details
+          path: |
+            syntax-output.txt
+            lint-output.txt
+            tests-output.txt
+            docker-output.txt
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Échouer le job si la syntaxe est invalide
+        if: steps.syntax.outcome == 'failure'
+        run: |
+          echo "La vérification de syntaxe a échoué."
+          exit 1
+
+      - name: Échouer le job si le lint a échoué
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "Le lint a échoué."
+          exit 1
+
+      - name: Échouer le job si des tests ont échoué
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "Des tests ont échoué."
+          exit 1
+
+      - name: Échouer le job si le build Docker a échoué
+        if: steps.docker.outcome == 'failure'
+        run: |
+          echo "Le build Docker a échoué."
+          exit 1
