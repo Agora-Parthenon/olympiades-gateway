@@ -5,9 +5,66 @@ const { expressjwt: jwt } = require('express-jwt');
 const http = require('http');
 const httpProxy = require('http-proxy');
 const url = require('url');
-const addresses = require("./addresses.json");
+const fs = require('fs');
+const path = require('path');
 const jsonwebtoken = require('jsonwebtoken');
 const cors = require('cors');
+
+// Services addresses come from a file provided by olympiades-infra (mounted in the
+// container), never hard-coded here: adding a game must not require a code change.
+const ADDRESSES_FILE = process.env.ADDRESSES_FILE || path.join(__dirname, 'addresses.json');
+const PLATFORM_SERVICE = 'platform';
+const SERVICE_NAME = /^[A-Za-z0-9_-]+$/;
+
+function checkService(service, where) {
+  if (!service || !SERVICE_NAME.test(service.name)) {
+    throw new Error(`${where}: "name" must be a non-empty string (letters, digits, - or _)`);
+  }
+  if (!Number.isInteger(service.port) || service.port < 1 || service.port > 65535) {
+    throw new Error(`${where}: "port" must be a number between 1 and 65535`);
+  }
+}
+
+function loadAddresses(file) {
+  let content;
+  try {
+    content = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    throw new Error(`cannot read the services addresses file ${file} (${err.code})`);
+  }
+
+  let addresses;
+  try {
+    addresses = JSON.parse(content);
+  } catch (err) {
+    throw new Error(`the services addresses file ${file} is not valid JSON (${err.message})`);
+  }
+
+  checkService(addresses.platform, '"platform"');
+  const games = addresses.games ?? [];
+  if (!Array.isArray(games)) {
+    throw new Error('"games" must be a list');
+  }
+
+  const names = new Set();
+  games.forEach((game, i) => {
+    checkService(game, `"games[${i}]"`);
+    if (game.name === PLATFORM_SERVICE || names.has(game.name)) {
+      throw new Error(`"games[${i}]": the name "${game.name}" is already used`);
+    }
+    names.add(game.name);
+  });
+
+  return { platform: addresses.platform, games };
+}
+
+let addresses;
+try {
+  addresses = loadAddresses(ADDRESSES_FILE);
+} catch (err) {
+  console.error(`Gateway cannot start: ${err.message}`);
+  process.exit(1);
+}
 
 const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:3000')
   .split(',')
@@ -96,7 +153,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 const platformProxy = createProxyMiddleware({
   target: `http://${addresses.platform.name}:${addresses.platform.port}`,
   changeOrigin: true,
-  pathRewrite: (path) => path.replace(`/api/${addresses.platform.name}`, ""),
+  pathRewrite: { '^/api/platform': '' },
   onProxyReq: (proxyReq, req) => {
     const payload = req.auth;
     if (payload) {
@@ -106,35 +163,44 @@ const platformProxy = createProxyMiddleware({
   },
 });
 
-// Proxy rules: route /api/platform -> platform:8080, /api/game -> game:8080
-app.use(`/api/${addresses.platform.name}`, platformProxy);
+// Proxy rules: /api/platform is fixed (only its target is configurable),
+// /api/<game> -> <game>:<port> for every game declared in the addresses file.
+app.use('/api/platform', platformProxy);
 app.use('/admin', requireRole('ROLE_ADMIN'), platformProxy);
-for (const game in addresses.games) {
-    app.use(`/api/${game.name}`, createProxyMiddleware(
-        {
-            target: `http://${game.name}:${game.port}`,
-            changeOrigin: true,
-            pathRewrite: (path) => path.replace(`/api/${game.name}`, "")
-        }
-    ));
+for (const game of addresses.games) {
+  app.use(
+    `/api/${game.name}`,
+    createProxyMiddleware({
+      target: `http://${game.name}:${game.port}`,
+      changeOrigin: true,
+      pathRewrite: { [`^/api/${game.name}`]: '' },
+    })
+  );
 }
 
-//handling errors in api calls
+// Anything else under /api targets a service that is not declared
 app.use('/api', (req, res) => {
-    const parsed = url.parse(req.url, true);
-    const service = parsed.query.service || parsed.pathname.split('/')[1] || "";
-    const returnMessage = service === "" ?
-        {
-            "error": `no service asked`,
-            "message": "Request must contains service name"
-        } :
-        {
-            "error": `unknown service: ${service}`,
-            "message": "You are trying to request a service that may not exist " +
-                "or the service name provided in request is invalid"
-        };
-    res.status(400).send(returnMessage);
-})
+  const parsed = url.parse(req.url, true);
+  const service = parsed.query.service || parsed.pathname.split('/')[1] || '';
+  res.status(404).json(
+    service === ''
+      ? { error: 'no service asked', message: 'Request must contain a service name' }
+      : {
+          error: 'unknown service',
+          service,
+          message: 'This service does not exist or is not declared in the gateway configuration',
+        }
+  );
+});
+
+// 'game' is a legacy alias that always meant the platform backend
+function resolveWsTarget(service) {
+  if (service === PLATFORM_SERVICE || service === 'game') {
+    return `ws://${addresses.platform.name}:${addresses.platform.port}`;
+  }
+  const game = addresses.games.find((g) => g.name === service);
+  return game ? `ws://${game.name}:${game.port}` : null;
+}
 
 // Upgrade (WebSocket) handling: route by query param 'service' or path
 server.on('upgrade', async (req, socket, head) => {
@@ -155,14 +221,19 @@ server.on('upgrade', async (req, socket, head) => {
   }
 
   req.auth = payload;
-  const service = parsed.query.service || parsed.pathname.split('/')[2] || `${addresses.platform.name}`;
-  let target = `ws://${addresses.platform.name}:${addresses.platform.port}`;
-  for (const game in addresses.games) {
-      if (service === game.name || parsed.pathname.includes(game.name)) target = `ws://${game.name}:${game.port}`;
+  const service = parsed.query.service || parsed.pathname.split('/')[2] || PLATFORM_SERVICE;
+  const target = resolveWsTarget(service);
+  if (!target) {
+    rejectUpgrade(socket, 404, 'Not Found');
+    return;
   }
-  if (service === 'game' || parsed.pathname.includes('game'))
-      target = `ws://${addresses.platform.name}:${addresses.platform.port}`;
   proxy.ws(req, socket, head, { target });
+});
+
+// A game server that is down must not take the whole gateway down with it
+proxy.on('error', (err, req, socket) => {
+  console.error(`WebSocket proxy error: ${err.message}`);
+  if (socket && typeof socket.destroy === 'function') socket.destroy();
 });
 
 server.listen(PORT, () => console.log(`Gateway listening on ${PORT}`));
