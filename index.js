@@ -5,59 +5,15 @@ const { expressjwt: jwt } = require('express-jwt');
 const http = require('http');
 const httpProxy = require('http-proxy');
 const url = require('url');
-const fs = require('fs');
 const path = require('path');
 const jsonwebtoken = require('jsonwebtoken');
 const cors = require('cors');
+const { PLATFORM_SERVICE, loadAddresses, resolveWsTarget, stripApiPrefix } = require('./addresses');
+const { extractRoles, applyUserHeaders, applyUserHeadersToUpgrade } = require('./user-headers');
 
 // Services addresses come from a file provided by olympiades-infra (mounted in the
 // container), never hard-coded here: adding a game must not require a code change.
 const ADDRESSES_FILE = process.env.ADDRESSES_FILE || path.join(__dirname, 'addresses.json');
-const PLATFORM_SERVICE = 'platform';
-const SERVICE_NAME = /^[A-Za-z0-9_-]+$/;
-
-function checkService(service, where) {
-  if (!service || !SERVICE_NAME.test(service.name)) {
-    throw new Error(`${where}: "name" must be a non-empty string (letters, digits, - or _)`);
-  }
-  if (!Number.isInteger(service.port) || service.port < 1 || service.port > 65535) {
-    throw new Error(`${where}: "port" must be a number between 1 and 65535`);
-  }
-}
-
-function loadAddresses(file) {
-  let content;
-  try {
-    content = fs.readFileSync(file, 'utf8');
-  } catch (err) {
-    throw new Error(`cannot read the services addresses file ${file} (${err.code})`);
-  }
-
-  let addresses;
-  try {
-    addresses = JSON.parse(content);
-  } catch (err) {
-    throw new Error(`the services addresses file ${file} is not valid JSON (${err.message})`);
-  }
-
-  checkService(addresses.platform, '"platform"');
-  const games = addresses.games ?? [];
-  if (!Array.isArray(games)) {
-    throw new Error('"games" must be a list');
-  }
-
-  const names = new Set();
-  games.forEach((game, i) => {
-    checkService(game, `"games[${i}]"`);
-    if (game.name === PLATFORM_SERVICE || names.has(game.name)) {
-      throw new Error(`"games[${i}]": the name "${game.name}" is already used`);
-    }
-    names.add(game.name);
-  });
-
-  return { platform: addresses.platform, games };
-}
-
 let addresses;
 try {
   addresses = loadAddresses(ADDRESSES_FILE);
@@ -79,10 +35,6 @@ const KEYCLOAK_JWKS_URI =
 const app = express();
 const server = http.createServer(app);
 const proxy = httpProxy.createProxyServer({ ws: true });
-
-function extractRoles(payload) {
-  return payload.realm_access?.roles || [];
-}
 
 function requireRole(role) {
   return (req, res, next) => {
@@ -150,32 +102,25 @@ function rejectUpgrade(socket, code, message) {
 // Simple health
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-const platformProxy = createProxyMiddleware({
-  target: `http://${addresses.platform.name}:${addresses.platform.port}`,
-  changeOrigin: true,
-  pathRewrite: { '^/api/platform': '' },
-  onProxyReq: (proxyReq, req) => {
-    const payload = req.auth;
-    if (payload) {
-      proxyReq.setHeader('X-User-Id', payload.sub);
-      proxyReq.setHeader('X-User-Roles', extractRoles(payload).join(','));
-    }
-  },
-});
+// Every proxied service, platform or game, gets the caller's identity from the verified
+// token and never from what the client sent (see user-headers.js).
+function serviceProxy(name, port) {
+  return createProxyMiddleware({
+    target: `http://${name}:${port}`,
+    changeOrigin: true,
+    pathRewrite: stripApiPrefix(name),
+    onProxyReq: (proxyReq, req) => applyUserHeaders(proxyReq, req.auth),
+  });
+}
+
+const platformProxy = serviceProxy(addresses.platform.name, addresses.platform.port);
 
 // Proxy rules: /api/platform is fixed (only its target is configurable),
 // /api/<game> -> <game>:<port> for every game declared in the addresses file.
 app.use('/api/platform', platformProxy);
 app.use('/admin', requireRole('ROLE_ADMIN'), platformProxy);
 for (const game of addresses.games) {
-  app.use(
-    `/api/${game.name}`,
-    createProxyMiddleware({
-      target: `http://${game.name}:${game.port}`,
-      changeOrigin: true,
-      pathRewrite: { [`^/api/${game.name}`]: '' },
-    })
-  );
+  app.use(`/api/${game.name}`, serviceProxy(game.name, game.port));
 }
 
 // Anything else under /api targets a service that is not declared
@@ -192,15 +137,6 @@ app.use('/api', (req, res) => {
         }
   );
 });
-
-// 'game' is a legacy alias that always meant the platform backend
-function resolveWsTarget(service) {
-  if (service === PLATFORM_SERVICE || service === 'game') {
-    return `ws://${addresses.platform.name}:${addresses.platform.port}`;
-  }
-  const game = addresses.games.find((g) => g.name === service);
-  return game ? `ws://${game.name}:${game.port}` : null;
-}
 
 // Upgrade (WebSocket) handling: route by query param 'service' or path
 server.on('upgrade', async (req, socket, head) => {
@@ -222,11 +158,12 @@ server.on('upgrade', async (req, socket, head) => {
 
   req.auth = payload;
   const service = parsed.query.service || parsed.pathname.split('/')[2] || PLATFORM_SERVICE;
-  const target = resolveWsTarget(service);
+  const target = resolveWsTarget(addresses, service);
   if (!target) {
     rejectUpgrade(socket, 404, 'Not Found');
     return;
   }
+  applyUserHeadersToUpgrade(req, payload);
   proxy.ws(req, socket, head, { target });
 });
 
