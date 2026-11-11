@@ -28,7 +28,8 @@ The gateway does not hard-code where the platform and the games live. It reads a
   and on the WebSocket `/ws?service=<name>`. Adding a game only means editing that file and restarting.
 - Names are lowercase letters, digits, `-` or `_`: the name is both the route and the host name of the service.
 - A service that is not declared gets a `404` with a JSON error (HTTP) or is refused (WebSocket).
-- The caller's identity is sent to every service in `X-User-Id` and `X-User-Roles`, built from the
+- The caller's identity is sent to every service in `X-User-Id`, `X-User-Roles` and `X-User-Name` (the
+  username, URI-encoded, when the token has one), built from the
   verified token. Whatever the client sends under these names is replaced.
 - If the file is missing or invalid, the gateway stops at startup with a message saying why.
 
