@@ -12,7 +12,8 @@ function extractRoles(payload) {
 function identityHeaders(auth) {
   const headers = { 'x-user-id': auth.sub, 'x-user-roles': extractRoles(auth).join(',') };
   if (typeof auth.preferred_username === 'string' && auth.preferred_username !== '') {
-    headers['x-user-name'] = encodeURIComponent(auth.preferred_username);
+    // toWellFormed() swaps lone surrogates for U+FFFD: encodeURIComponent would throw on them
+    headers['x-user-name'] = encodeURIComponent(auth.preferred_username.toWellFormed());
   }
   return headers;
 }

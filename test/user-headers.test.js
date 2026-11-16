@@ -84,3 +84,11 @@ describe('username header', () => {
     assert.equal(req.headers['x-user-name'], 'lucy');
   });
 });
+
+describe('username header with an invalid string', () => {
+  test('does not throw on a lone surrogate (it would otherwise break the request)', () => {
+    const req = fakeProxyReq();
+    assert.doesNotThrow(() => applyUserHeaders(req, { ...auth, preferred_username: 'bad\uD800name' }));
+    assert.equal(decodeURIComponent(req.store['x-user-name']), 'bad�name');
+  });
+});
