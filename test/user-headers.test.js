@@ -56,3 +56,39 @@ describe('applyUserHeadersToUpgrade', () => {
     assert.equal(req.headers.origin, 'http://localhost:3000');
   });
 });
+
+describe('username header', () => {
+  test('sends the username from the token', () => {
+    const req = fakeProxyReq();
+    applyUserHeaders(req, { ...auth, preferred_username: 'lucy' });
+    assert.equal(req.store['x-user-name'], 'lucy');
+  });
+
+  test('URI-encodes it so any character is a valid header value', () => {
+    const req = fakeProxyReq();
+    applyUserHeaders(req, { ...auth, preferred_username: 'Zoë Łukasz@mail' });
+    assert.equal(req.store['x-user-name'], 'Zo%C3%AB%20%C5%81ukasz%40mail');
+    assert.equal(decodeURIComponent(req.store['x-user-name']), 'Zoë Łukasz@mail');
+  });
+
+  test('replaces a username forged by the client, even when the token has none', () => {
+    const req = fakeProxyReq({ 'X-User-Name': 'admin' });
+    applyUserHeaders(req, auth);
+    assert.equal(req.store['x-user-name'], undefined);
+    assert.equal(req.store['X-User-Name'], undefined);
+  });
+
+  test('is also set on a WebSocket upgrade', () => {
+    const req = { headers: { 'x-user-name': 'forged' } };
+    applyUserHeadersToUpgrade(req, { ...auth, preferred_username: 'lucy' });
+    assert.equal(req.headers['x-user-name'], 'lucy');
+  });
+});
+
+describe('username header with an invalid string', () => {
+  test('does not throw on a lone surrogate (it would otherwise break the request)', () => {
+    const req = fakeProxyReq();
+    assert.doesNotThrow(() => applyUserHeaders(req, { ...auth, preferred_username: 'bad\uD800name' }));
+    assert.equal(decodeURIComponent(req.store['x-user-name']), 'bad�name');
+  });
+});
